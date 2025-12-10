@@ -314,6 +314,7 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
+
 # ------------------------------------------------------------------------------
 # Billing tab (balances & due dates) via hydroqc
 # ------------------------------------------------------------------------------
@@ -321,113 +322,151 @@ with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
 
     st.caption(
-        "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) which exposes account/customer/web‑session "
-        "flows beyond consumption. If your installed version differs, we’ll introspect available methods. "
-        "Install: `pip install Hydro-Quebec-API-Wrapper`."
+        "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) for account & billing. "
+        "Usage remains powered by `hydroq-api`."
     )
 
-    # Cache hydroqc web user login as a resource (like a session/client)
-    @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
-    def get_hydroqc_user(_email: str, _password: str) -> Any:
-        """
-        Create a hydroqc WebUser or client, log in, and return the object.
+    # Optional IDs from secrets (improve billing calls on some hydroqc versions)
+    cust_id = st.secrets.get("HQ_CUSTOMER_ID")
+    acct_id = st.secrets.get("HQ_ACCOUNT_ID")
+    ctrt_id = st.secrets.get("HQ_CONTRACT_ID")
 
-        hydroqc covers account, contract, customer, webuser modules. Exact public methods vary by version and
-        are documented across the repo and docs. We use a resilient approach to try common patterns and
-        introspect available attributes. 
+    @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
+    def get_hydroqc_session(_email: str, _password: str):
         """
+        Build a hydroqc session. Try multiple constructor signatures because they vary by version:
+        - WebUser(email, password, verify_ssl=True)
+        - WebUser(email, password)
+        - HydroClient(email, password)
+        Attach customer/account/contract identifiers when available.
+        """
+        # Import inside function so the app can run even if hydroqc isn't installed yet
         try:
-            # Most builds expose a WebUser interface for authenticated portal flows:
             from hydroqc.webuser import WebUser  # type: ignore
-            user = WebUser(_email, _password)
+            try:
+                # Most recent builds expect verify_ssl as a positional argument
+                user = WebUser(_email, _password, True)
+            except TypeError:
+                # Older builds: no verify_ssl in signature
+                user = WebUser(_email, _password)
+            # Login
             user.login()
+            # Attach identifiers if the object supports them
+            if cust_id and hasattr(user, "customer"):
+                try: setattr(user, "customer", cust_id)
+                except Exception: pass
+            if acct_id and hasattr(user, "account"):
+                try: setattr(user, "account", acct_id)
+                except Exception: pass
+            if ctrt_id and hasattr(user, "contract"):
+                try: setattr(user, "contract", ctrt_id)
+                except Exception: pass
             return user
-        except Exception as e:
-            # Fallback: some versions use a HydroClient (hydro_api.client)
+        except Exception as e_webuser:
+            # Fallback to HydroClient form
             try:
                 from hydroqc.hydro_api.client import HydroClient  # type: ignore
-                client = HydroClient()
-                # Depending on version, there may be async/await; if so, we’d adapt here.
-                # For now, try a simple login flow or raise.
-                if hasattr(client, "login"):
-                    client.login(_email, _password)
+                try:
+                    client = HydroClient(_email, _password)
+                except TypeError:
+                    # Last resort: if constructor needs only username, we try login later
+                    client = HydroClient()
+                    if hasattr(client, "login"):
+                        client.login(_email, _password)
+                # Attach identifiers if the object supports them
+                for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
+                    if value and hasattr(client, name):
+                        try: setattr(client, name, value)
+                        except Exception: pass
                 return client
-            except Exception as e2:
+            except Exception as e_client:
                 raise RuntimeError(
-                    f"Unable to initialize hydroqc session. Make sure Hydro-Quebec-API-Wrapper is installed. "
-                    f"Primary error: {e}; fallback error: {e2}"
+                    f"Unable to initialize hydroqc session. "
+                    f"WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    # Try to extract billing summary using multiple likely methods/attributes
-    def try_get_billing_summary(hq_obj: Any) -> Dict[str, Any]:
+    def try_get_billing_summary(hq_obj):
         """
-        Attempt to fetch balance & due date(s) via hydroqc across versions.
-
-        Strategy:
-        1) Try common method names directly (get_balance, get_billing_info, get_current_invoice).
-        2) Explore user/account/contract attributes and call candidate methods found there.
-        3) Return a normalized dict if possible; else return diagnostics.
+        Attempt to fetch balance & due date across hydroqc versions.
+        We probe common methods on root and nested modules (account/customer/contract/contracts).
         """
         candidates = [
-            ("get_balance", {}),
-            ("get_billing_info", {}),
-            ("get_current_invoice", {}),
-            ("get_invoices", {}),
-            ("billing_summary", {}),
+            "get_balance", "get_billing_info", "get_current_invoice",
+            "get_invoices", "billing_summary",
         ]
-
         # Direct calls on the root object
-        for name, kwargs in candidates:
+        for name in candidates:
             if hasattr(hq_obj, name):
                 try:
-                    data = getattr(hq_obj, name)(**kwargs)
-                    return {"source": f"root.{name}", "raw": data}
+                    return {"source": f"root.{name}", "raw": getattr(hq_obj, name)()}
                 except Exception:
                     pass
 
-        # Inspect attributes where billing commonly lives
-        nested_attrs = ["account", "customer", "contract", "contracts"]
-        for attr in nested_attrs:
+        # Look into common containers
+        for attr in ["account", "customer", "contract", "contracts"]:
             if hasattr(hq_obj, attr):
                 obj = getattr(hq_obj, attr)
-                # If it's callable (method returning data), call it
+                # If it's callable, call it; might return a dict summary
                 if callable(obj):
                     try:
                         data = obj()
-                        # If data itself has balance/amount/dueDate, return that
                         if isinstance(data, dict):
                             return {"source": f"{attr}()", "raw": data}
                     except Exception:
                         pass
+                # Try candidate methods on nested object(s)
+                if isinstance(obj, (list, tuple)):
+                    found = []
+                    for i, elem in enumerate(obj):
+                        for name in candidates:
+                            if hasattr(elem, name):
+                                try:
+                                    data = getattr(elem, name)()
+                                    found.append({"source": f"{attr}[{i}].{name}", "raw": data})
+                                except Exception:
+                                    pass
+                    if found:
+                        return {"source": f"{attr}[*]", "raw": found}
+                else:
+                    for name in candidates:
+                        if hasattr(obj, name):
+                            try:
+                                return {"source": f"{attr}.{name}", "raw": getattr(obj, name)()}
+                            except Exception:
+                                pass
+        return {"error": "No billing method found.", "dir": dir(hq_obj)}
 
-                # Try methods inside the nested object
-                for name, kwargs in candidates:
-                    if hasattr(obj, name):
-                        try:
-                            data = getattr(obj, name)(**kwargs)
-                            return {"source": f"{attr}.{name}", "raw": data}
-                        except Exception:
-                            pass
+    def normalize_billing_rows(raw):
+        """
+        Convert various shapes to rows with 'amount' and 'due_date' keys.
+        """
+        rows = []
 
-                # If iterable (e.g., contracts), iterate and try typical getters
-                try:
-                    if isinstance(obj, (list, tuple)):
-                        summary_list: List[Dict[str, Any]] = []
-                        for i, cobj in enumerate(obj):
-                            for name, kwargs in candidates:
-                                if hasattr(cobj, name):
-                                    try:
-                                        data = getattr(cobj, name)(**kwargs)
-                                        summary_list.append({"contract_index": i, "source": f"{attr}[{i}].{name}", "raw": data})
-                                    except Exception:
-                                        pass
-                        if summary_list:
-                            return {"source": f"{attr}[*]", "raw": summary_list}
-                except Exception:
-                    pass
+        def pick_amount_and_due(d: dict):
+            if not isinstance(d, dict): return {}
+            # try common keys (case-insensitive)
+            lower = {k.lower(): k for k in d.keys()}
+            amt_key = next((lower[k] for k in lower if "amount" in k or "balance" in k), None)
+            due_key = next((lower[k] for k in lower if "due" in k and "date" in k), None)
+            return {
+                "amount": d.get(amt_key) if amt_key else None,
+                "due_date": d.get(due_key) if due_key else None,
+            }
 
-        # If nothing matched, provide diagnostics
-        return {"error": "No billing method found on hydroqc object.", "dir": dir(hq_obj)}
+        if isinstance(raw, dict):
+            rows.append(pick_amount_and_due(raw))
+        elif isinstance(raw, list):
+            for elem in raw:
+                if isinstance(elem, dict) and "raw" in elem:
+                    val = elem["raw"]
+                    if isinstance(val, dict):
+                        rows.append(pick_amount_and_due(val))
+                    elif isinstance(val, list):
+                        for v in val:
+                            if isinstance(v, dict): rows.append(pick_amount_and_due(v))
+                elif isinstance(elem, dict):
+                    rows.append(pick_amount_and_due(elem))
+        return pd.DataFrame(rows)
 
     # UI: RUN button for billing
     col_b1, col_b2 = st.columns([1, 1])
@@ -440,22 +479,22 @@ with billing_tab:
 
     if run_billing:
         try:
-            hq_user = get_hydroqc_user(email, password)
+            hq_session = get_hydroqc_session(email, password)
             st.caption("Logged in (billing).")
         except Exception as e:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        # Fetch summary in a resilient way
-        summary = try_get_billing_summary(hq_user)
+        summary = try_get_billing_summary(hq_session)
+
         if "error" in summary:
             st.error("Could not find billing methods on this hydroqc version.")
             with st.expander("Diagnostics"):
-                st.write("Available attributes/methods:", summary.get("dir"))
+                st.write("Attributes/methods on session:", summary.get("dir"))
                 st.info(
-                    "The hydroqc library exposes account/customer/contract/webuser modules and is the "
-                    "recommended solution for account & billing data. If your installed version differs, "
-                    "upgrading may expose helpers like account balance or invoice endpoints."
+                    "Tip: Ensure the latest Hydro‑Quebec API Wrapper (`Hydro-Quebec-API-Wrapper`) is installed. "
+                    "Some versions rely on customer/account/contract IDs (from your invoice). "
+                    "See hydroqc configuration docs for field names."  # customer/account/contract
                 )
         else:
             raw = summary.get("raw")
@@ -463,47 +502,20 @@ with billing_tab:
             st.write("Raw billing data:")
             st.json(raw)
 
-            # Attempt to normalize common keys (amount & due date)
-            # This covers typical schemas like: {'amount': 123.45, 'dueDate': '2025-12-28', ...}
-            def normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
-                keys = {k.lower(): k for k in item.keys()}
-                amount_key = next((item[k] for k in item.keys() if "amount" in k.lower() or "balance" in k.lower()), None)
-                due_key    = next((k for k in item.keys() if "due" in k.lower() and "date" in k.lower()), None)
-                return {
-                    "amount": item.get(amount_key) if isinstance(amount_key, str) else amount_key,
-                    "due_date": item.get(due_key),
-                }
-
-            rows: List[Dict[str, Any]] = []
-            if isinstance(raw, dict):
-                rows.append(normalize_item(raw))
-            elif isinstance(raw, list):
-                for elem in raw:
-                    if isinstance(elem, dict) and "raw" in elem:
-                        val = elem["raw"]
-                        if isinstance(val, dict):
-                            rows.append(normalize_item(val))
-                        elif isinstance(val, list):
-                            for v in val:
-                                if isinstance(v, dict):
-                                    rows.append(normalize_item(v))
-                    elif isinstance(elem, dict):
-                        rows.append(normalize_item(elem))
-
-            df_billing = pd.DataFrame(rows)
+            df_billing = normalize_billing_rows(raw)
             st.subheader("Balances & due dates (normalized)")
             if df_billing.empty:
                 st.info("Could not normalize billing fields automatically. See raw data above.")
             else:
                 st.dataframe(df_billing, use_container_width=True)
 
-    # Info & references
+    # References/notes
     st.markdown(
         """
         **Notes**  
-        • `hydroq-api` is designed for consumption retrieval and does not document invoice/billing endpoints.  
-        • `hydroqc` (Hydro‑Quebec API Wrapper) exposes broader capabilities (account, customer, contract, webuser).  
-        """,
+        • `hydroq-api` is for consumption; invoices/billing are not documented in that library.  
+        • `hydroqc` provides broader account/customer/contract/webuser flows; see docs & config guide.  
+        """
     )
     st.caption(
         "References: hydroq-api on PyPI/GitHub; hydroqc on PyPI and docs."
