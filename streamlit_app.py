@@ -314,8 +314,9 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
+
 # ------------------------------------------------------------------------------
-# Billing tab (balances & due dates) via hydroqc — async aware
+# Billing tab (balances & due dates) via hydroqc — async + detailed errors
 # ------------------------------------------------------------------------------
 with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
@@ -324,25 +325,35 @@ with billing_tab:
         "Usage remains powered by `hydroq-api` (consumption only)."
     )
 
-    # --- Async helpers ---
+    import asyncio, inspect, threading, json
+    from typing import Any, Dict, List
+
+    # --- Async helpers with ERROR VISIBILITY ---
     def run_coro(coro):
-        """Run a coroutine safely in Streamlit."""
+        """Run a coroutine safely in Streamlit and propagate exceptions."""
         try:
             return asyncio.run(coro)
         except RuntimeError:
-            # If an event loop is already running, run in a separate thread with a new loop
+            # If Streamlit has a loop, run ours in a worker thread
             result_container: Dict[str, Any] = {}
+            error_container: Dict[str, Any] = {}
             def runner():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                result_container["result"] = loop.run_until_complete(coro)
-                loop.close()
+                try:
+                    result_container["result"] = loop.run_until_complete(coro)
+                except Exception as e:
+                    error_container["error"] = e
+                finally:
+                    loop.close()
             t = threading.Thread(target=runner)
             t.start(); t.join()
+            if "error" in error_container:
+                raise error_container["error"]
             return result_container.get("result")
 
     def maybe_call_async(func, *args, **kwargs):
-        """Call a function; if it returns a coroutine, await it."""
+        """Call a function; if it returns a coroutine, await it and surface exceptions."""
         res = func(*args, **kwargs)
         return run_coro(res) if inspect.iscoroutine(res) else res
 
@@ -386,37 +397,28 @@ with billing_tab:
                     f"Unable to initialize hydroqc session. WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    # --- Coercion and flexible calls ---
-    def coerce_to_jsonlike(x: Any) -> Any:
-        """Best effort: dict/list if possible; else original for st.write()."""
-        if x is None:
-            return None
-        if isinstance(x, (dict, list, tuple)):
-            return x
-        if isinstance(x, str):
-            try:
-                return json.loads(x)
-            except Exception:
-                return x
-        if hasattr(x, "__dict__"):
-            try:
-                d = vars(x).copy()
-                for k, v in list(d.items()):
-                    if callable(v): d.pop(k, None)
-                return d
-            except Exception:
-                pass
-        return x
+    # --- Safe render (dict/list or fall back to write) ---
+    def safe_show(title: str, value: Any):
+        with st.expander(title):
+            if isinstance(value, (dict, list)):
+                st.json(value)
+            else:
+                st.write(type(value).__name__, value)
 
+    # --- Flexible call with signature probing and EXCEPTION REPORTING ---
+    import inspect
     def flexible_call(obj: Any, method_name: str) -> Any:
-        """Call obj.method_name and await if needed; pass IDs if signature supports them."""
+        """Call obj.method_name and await if needed; pass IDs if signature supports them; show exceptions."""
         if not hasattr(obj, method_name):
+            st.warning(f"{method_name} not found on session object.")
             return None
         m = getattr(obj, method_name)
+        # Try no-arg call
         try:
-            res = m()  # try no-arg call
+            res = m()
             return run_coro(res) if inspect.iscoroutine(res) else res
-        except TypeError:
+        except Exception as e1:
+            # Try kwargs with invoice IDs
             try:
                 sig = inspect.signature(m)
                 kwargs = {}
@@ -428,14 +430,14 @@ with billing_tab:
                     if p in {"verify_ssl"}: kwargs[pname] = True
                 res = m(**kwargs)
                 return run_coro(res) if inspect.iscoroutine(res) else res
-            except Exception:
+            except Exception as e2:
+                # Show both exceptions clearly
+                st.error(f"{method_name} failed (no-arg): {e1}")
+                st.error(f"{method_name} failed (kwargs): {e2}")
                 return None
 
+    # --- Normalize billing (English & French keys) ---
     def deep_find_items(obj) -> List[Dict[str, Any]]:
-        """
-        Recursively walk dict/list and extract candidate billing dicts that contain
-        amount/balance and due date. Supports English & French keys commonly seen.
-        """
         found: List[Dict[str, Any]] = []
         amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
         due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
@@ -467,8 +469,17 @@ with billing_tab:
     def normalize_billing(raws: List[Any]) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
         for raw in raws:
-            j = coerce_to_jsonlike(raw)
-            rows.extend(deep_find_items(j))
+            if raw is None:  # skip empties
+                continue
+            if isinstance(raw, (dict, list)):
+                rows.extend(deep_find_items(raw))
+            else:
+                # Try to JSON-decode strings
+                if isinstance(raw, str):
+                    try:
+                        j = json.loads(raw); rows.extend(deep_find_items(j))
+                    except Exception:
+                        pass
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).drop_duplicates()
@@ -499,32 +510,26 @@ with billing_tab:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        # Call/await the methods your session exposes
+        # Call methods your session lists (and surface exceptions if any)
         portal_status = flexible_call(hq_session, "check_hq_portal_status")
         raw_info      = flexible_call(hq_session, "get_info")
         raw_customers = flexible_call(hq_session, "fetch_customers_info")
-        raw_customer1 = flexible_call(hq_session, "get_customer")  # singular record (some versions)
+        raw_customer1 = flexible_call(hq_session, "get_customer")
+        customers_prop = getattr(hq_session, "customers", None)
 
-        # Show raw values safely
-        with st.expander("Portal status (raw)"):
-            st.write(type(portal_status).__name__, portal_status)
-        with st.expander("get_info (raw)"):
-            st.write(type(raw_info).__name__, raw_info)
-        with st.expander("fetch_customers_info (raw)"):
-            st.write(type(raw_customers).__name__, raw_customers)
-        with st.expander("get_customer (raw)"):
-            st.write(type(raw_customer1).__name__, raw_customer1)
-        with st.expander("customers property (raw)"):
-            st.write(type(getattr(hq_session, "customers", None)).__name__, getattr(hq_session, "customers", None))
+        safe_show("Portal status (raw)", portal_status)
+        safe_show("get_info (raw)", raw_info)
+        safe_show("fetch_customers_info (raw)", raw_customers)
+        safe_show("get_customer (raw)", raw_customer1)
+        safe_show("customers property (raw)", customers_prop)
 
-        df_billing = normalize_billing([portal_status, raw_info, raw_customers, raw_customer1, getattr(hq_session, "customers", None)])
+        df_billing = normalize_billing([portal_status, raw_info, raw_customers, raw_customer1, customers_prop])
 
         st.subheader("Balances & due dates (normalized)")
         if df_billing.empty:
             st.info(
-                "Could not normalize billing fields automatically. Inspect the raw outputs above and share any "
-                "balance/amount and due‑date keys you see (e.g., 'solde', 'montantFacture', 'dateEcheance'); "
-                "I’ll add precise mappings."
+                "No billing fields were found. If errors appeared above, they typically indicate a portal maintenance, "
+                "a version mismatch, or missing invoice IDs (customer/account/contract)."
             )
         else:
             st.dataframe(df_billing, use_container_width=True)
@@ -532,8 +537,8 @@ with billing_tab:
     st.markdown(
         """
         **Notes**  
-        • `st.json` renders valid JSON (dict/list or JSON strings). If a method returns a coroutine or a non‑JSON object, prefer `st.write` or coerce it first. [1](https://github.com/lvg77/hydroq-api/releases)  
-        • Caching async objects/functions is not supported by Streamlit; we avoid caching awaited results and only cache the session resource. [2](https://hydroqc.readthedocs.io/en/latest/reference/hydroqc.hydro_api.html)[3](https://gitlab.com/hydroqc/hydroqc/-/blob/main/README.md)  
-        • `hydroq-api` focuses on consumption (hourly/daily/monthly), while `hydroqc` retrieves broader account info (balance, billing period projection). [4](https://github.com/hydrohub2/Hydroq)[5](https://procodebase.com/article/integrating-apis-with-streamlit-applications)
+        • `st.json` only renders valid JSON (dict/list or JSON strings); for other types use `st.write`. [5](https://github.com/lvg77/hydroq-api/releases)  
+        • Streamlit does not officially support caching **async** functions; we await results without caching them. [6](https://hydroqc.readthedocs.io/en/latest/reference/hydroqc.hydro_api.html)[7](https://gitlab.com/hydroqc/hydroqc/-/blob/main/README.md)  
+        • The `hydroqc` project can retrieve **general account data** (balance, billing period projection), but portal changes or outages can cause calls to fail. [8](https://procodebase.com/article/integrating-apis-with-streamlit-applications)[1](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.cache_resource)
         """
     )
