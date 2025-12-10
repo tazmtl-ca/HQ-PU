@@ -2,3 +2,4 @@ streamlit
 hydroq-api
 pandas
 matplotlib
+Hydro-Quebec-API-Wrapper
