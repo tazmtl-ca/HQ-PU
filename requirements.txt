@@ -2,4 +2,4 @@ streamlit
 hydroq-api
 pandas
 matplotlib
-Hydro-Quebec-API-Wrapper
+Hydro-Quebec-API-Wrapper==4.2.5
