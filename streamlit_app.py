@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from hydroq_api import HydroQuebec
 import requests  # HTTPError handling
 import json
-from typing import Tuple, Any, Dict, List
+from typing import Tuple, Any, Dict, List, Optional
 
 # ------------------------------------------------------------------------------
 # Page config
@@ -24,8 +24,7 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
         "compare": { ... last year's month ... },
         "courant": { ... current month's data ... }
       }
-    Returns (df_monthly_current, df_monthly_compare) with columns:
-      month, kwh, start_date, end_date, avg_kwh_per_day, avg_temp
+    Returns (df_monthly_current, df_monthly_compare).
     """
     if df_raw is None or df_raw.empty or "results" not in df_raw.columns:
         return pd.DataFrame(), pd.DataFrame()
@@ -44,7 +43,6 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
             cur = payload.get("courant") or {}
             cmp = payload.get("compare") or {}
 
-            # Current year
             cur_start = cur.get("dateDebutMois")
             cur_end   = cur.get("dateFinMois")
             cur_total = cur.get("consoTotalMois")
@@ -61,7 +59,6 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
                     "avg_temp": cur_temp,
                 })
 
-            # Same month last year (compare)
             cmp_start = cmp.get("dateDebutMois")
             cmp_end   = cmp.get("dateFinMois")
             cmp_total = cmp.get("consoTotalMois")
@@ -98,7 +95,7 @@ def normalize_usage_df(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
     date_candidates_daily  = ["date", "jour", "day", "periode", "period"]
     ts_candidates_hourly   = ["timestamp", "time", "datetime", "heure", "period", "periode"]
 
-    def first_existing(cands: List[str]) -> Any:
+    def first_existing(cands: List[str]) -> Optional[str]:
         for c in cands:
             if c in df.columns:
                 return c
@@ -154,7 +151,7 @@ if not email or not password:
     st.error("Missing HQ_EMAIL / HQ_PASSWORD secrets in Streamlit Cloud.")
     st.stop()
 
-# Optional identifiers that some hydroqc billing flows use (from your invoice)
+# Optional identifiers used by some hydroqc billing flows (from your invoice)
 cust_id = st.secrets.get("HQ_CUSTOMER_ID")
 acct_id = st.secrets.get("HQ_ACCOUNT_ID")
 ctrt_id = st.secrets.get("HQ_CONTRACT_ID")
@@ -245,7 +242,6 @@ with usage_tab:
             st.stop()
 
         try:
-            # Ensure client is created; also confirms login credentials
             _ = get_hydroqapi_client(email, password)
             st.caption("Logged in (usage).")
         except requests.exceptions.HTTPError as http_err:
@@ -259,7 +255,6 @@ with usage_tab:
             if granularity == "Hourly":
                 df = fetch_hourly_df(email, password)
                 df = normalize_usage_df(df, "Hourly")
-
                 st.subheader("Hourly usage (last 24h)")
                 st.dataframe(df, use_container_width=True)
                 if df.empty:
@@ -272,7 +267,6 @@ with usage_tab:
             elif granularity == "Daily":
                 df = fetch_daily_df(email, password, start_date.isoformat(), end_date.isoformat())
                 df = normalize_usage_df(df, "Daily")
-
                 st.subheader(f"Daily usage ({start_date} → {end_date})")
                 st.dataframe(df, use_container_width=True)
                 if df.empty:
@@ -284,26 +278,22 @@ with usage_tab:
 
             else:  # Monthly
                 df_api = fetch_monthly_df(email, password)
-
                 with st.expander("Raw monthly API payload (first 10 rows)"):
                     st.write("Shape:", df_api.shape)
                     st.dataframe(df_api.head(10))
 
                 if "results" in df_api.columns:
                     df_current, df_compare = parse_monthly_rows_from_results(df_api)
-
                     tab1, tab2 = st.tabs(["Current year", "Same month last year"])
                     with tab1:
                         st.dataframe(df_current, use_container_width=True)
                     with tab2:
                         st.dataframe(df_compare, use_container_width=True)
-
                     if df_current.empty:
                         st.warning("No monthly data (current) parsed from API.")
                     else:
                         st.subheader("Monthly usage (current year)")
                         st.bar_chart(df_current.set_index("month")["kwh"])
-
                 else:
                     df = normalize_usage_df(df_api, "Monthly")
                     st.dataframe(df, use_container_width=True)
@@ -328,35 +318,28 @@ with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
     st.caption(
         "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) for account & billing. "
-        "Usage remains powered by `hydroq-api`."
+        "Usage remains powered by `hydroq-api` (consumption only)."
     )
 
+    # --- Build hydroqc session (robust across versions) ---
     @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
     def get_hydroqc_session(_email: str, _password: str):
         """
-        Build a hydroqc session. Try multiple constructor signatures because they vary by version:
-        - WebUser(email, password, verify_ssl=True)
-        - WebUser(email, password)
-        - HydroClient(email, password) or HydroClient() + login
-        Attach customer/account/contract identifiers when available.
+        Try:
+          WebUser(email, password, True) → WebUser(email, password) → HydroClient(email, password) → HydroClient() + login.
+        Attach customer/account/contract identifiers when supported by the object.
         """
         try:
             from hydroqc.webuser import WebUser  # type: ignore
             try:
-                user = WebUser(_email, _password, True)  # newer builds: verify_ssl required
+                user = WebUser(_email, _password, True)  # some builds require verify_ssl
             except TypeError:
-                user = WebUser(_email, _password)        # older builds
+                user = WebUser(_email, _password)
             user.login()
-            # Attach identifiers if supported
-            if cust_id and hasattr(user, "customer"):
-                try: setattr(user, "customer", cust_id)
-                except Exception: pass
-            if acct_id and hasattr(user, "account"):
-                try: setattr(user, "account", acct_id)
-                except Exception: pass
-            if ctrt_id and hasattr(user, "contract"):
-                try: setattr(user, "contract", ctrt_id)
-                except Exception: pass
+            for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
+                if value and hasattr(user, name):
+                    try: setattr(user, name, value)
+                    except Exception: pass
             return user
         except Exception as e_webuser:
             try:
@@ -374,95 +357,85 @@ with billing_tab:
                 return client
             except Exception as e_client:
                 raise RuntimeError(
-                    f"Unable to initialize hydroqc session. "
-                    f"WebUser error: {e_webuser}; HydroClient error: {e_client}"
+                    f"Unable to initialize hydroqc session. WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    def try_get_billing_summary(hq_obj: Any) -> Dict[str, Any]:
+    # --- Extract billing from available methods/properties ---
+    def safe_call(obj, name) -> Any:
+        if hasattr(obj, name):
+            try:
+                return getattr(obj, name)()
+            except Exception:
+                return None
+        return None
+
+    def deep_find_items(obj) -> List[Dict[str, Any]]:
         """
-        Attempt to fetch balance & due date across hydroqc versions.
-        Probe common methods on root and nested modules (account/customer/contract/contracts).
+        Recursively walk dict/list and extract candidate billing dicts that contain amount/balance and due date.
+        Supports English/French keys typically seen in HQ portal JSONs.
         """
-        candidates = [
-            "get_balance", "get_billing_info", "get_current_invoice",
-            "get_invoices", "billing_summary",
-        ]
+        found: List[Dict[str, Any]] = []
+        amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
+        due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
 
-        # Direct calls on the root object
-        for name in candidates:
-            if hasattr(hq_obj, name):
-                try:
-                    return {"source": f"root.{name}", "raw": getattr(hq_obj, name)()}
-                except Exception:
-                    pass
+        def has_any_key(d: Dict[str, Any], keys: set) -> Optional[str]:
+            for k in d.keys():
+                if k and isinstance(k, str) and k.replace("_", "").replace("-", "").lower() in keys:
+                    return k
+            return None
 
-        # Look into common containers
-        for attr in ["account", "customer", "contract", "contracts"]:
-            if hasattr(hq_obj, attr):
-                obj = getattr(hq_obj, attr)
-                if callable(obj):
-                    try:
-                        data = obj()
-                        if isinstance(data, dict):
-                            return {"source": f"{attr}()", "raw": data}
-                    except Exception:
-                        pass
+        def walk(x):
+            if isinstance(x, dict):
+                amt_k = has_any_key(x, amount_keys)
+                due_k = has_any_key(x, due_keys)
+                if amt_k or due_k:
+                    # Keep a lightweight record with the best-matching fields
+                    rec = {
+                        "amount": x.get(amt_k) if amt_k else None,
+                        "due_date": x.get(due_k) if due_k else None,
+                    }
+                    # Try to capture contract or account identifiers if present
+                    for id_key in ["contract", "numeroContrat", "contractId", "account", "compte", "accountId", "customer", "client", "customerId"]:
+                        if id_key in x:
+                            rec[id_key] = x.get(id_key)
+                    found.append(rec)
+                # Continue walking nested dicts/lists
+                for v in x.values(): walk(v)
+            elif isinstance(x, list):
+                for v in x: walk(v)
 
-                if isinstance(obj, (list, tuple)):
-                    found = []
-                    for i, elem in enumerate(obj):
-                        for name in candidates:
-                            if hasattr(elem, name):
-                                try:
-                                    data = getattr(elem, name)()
-                                    found.append({"source": f"{attr}[{i}].{name}", "raw": data})
-                                except Exception:
-                                    pass
-                    if found:
-                        return {"source": f"{attr}[*]", "raw": found}
-                else:
-                    for name in candidates:
-                        if hasattr(obj, name):
-                            try:
-                                return {"source": f"{attr}.{name}", "raw": getattr(obj, name)()}
-                            except Exception:
-                                pass
+        walk(obj)
+        return found
 
-        return {"error": "No billing method found.", "dir": dir(hq_obj)}
-
-    def normalize_billing_rows(raw: Any) -> pd.DataFrame:
+    def normalize_billing(raws: List[Any]) -> pd.DataFrame:
         """
-        Convert various shapes to rows with 'amount' and 'due_date' keys.
+        Merge multiple raw structures into a flat table with amount/due_date and identifiers if available.
         """
         rows: List[Dict[str, Any]] = []
+        for raw in raws:
+            rows.extend(deep_find_items(raw))
+        # Deduplicate rows that have same (amount, due_date)
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df.drop_duplicates()
+        # Convert amount to numeric if possible
+        for col in ["amount"]:
+            if col in df.columns:
+                try:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                except Exception:
+                    pass
+        # Sort by due_date if present
+        if "due_date" in df.columns:
+            try:
+                df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
+                df = df.sort_values("due_date", na_position="last")
+            except Exception:
+                pass
+        return df
 
-        def pick_amount_and_due(d: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(d, dict): return {}
-            lower = {k.lower(): k for k in d.keys()}
-            amt_key = next((lower[k] for k in lower if ("amount" in k or "balance" in k)), None)
-            due_key = next((lower[k] for k in lower if ("due" in k and "date" in k)), None)
-            return {
-                "amount": d.get(amt_key) if amt_key else None,
-                "due_date": d.get(due_key) if due_key else None,
-            }
-
-        if isinstance(raw, dict):
-            rows.append(pick_amount_and_due(raw))
-        elif isinstance(raw, list):
-            for elem in raw:
-                if isinstance(elem, dict) and "raw" in elem:
-                    val = elem["raw"]
-                    if isinstance(val, dict):
-                        rows.append(pick_amount_and_due(val))
-                    elif isinstance(val, list):
-                        for v in val:
-                            if isinstance(v, dict): rows.append(pick_amount_and_due(v))
-                elif isinstance(elem, dict):
-                    rows.append(pick_amount_and_due(elem))
-
-        return pd.DataFrame(rows)
-
-    # UI: RUN button for billing
+    # --- Billing Run UI ---
     col_b1, col_b2 = st.columns([1, 1])
     with col_b1:
         run_billing = st.button("▶️ RUN (Billing)")
@@ -479,33 +452,31 @@ with billing_tab:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        summary = try_get_billing_summary(hq_session)
+        # Prefer direct helpers first (seen in your attribute list)
+        raw_info      = safe_call(hq_session, "get_info")
+        raw_customers = safe_call(hq_session, "fetch_customers_info")
+        # Also check 'customers' attribute if populated (could be dict/list)
+        raw_customers_prop = getattr(hq_session, "customers", None)
 
-        if "error" in summary:
-            st.error("Could not find billing methods on this hydroqc version.")
-            with st.expander("Diagnostics"):
-                st.write("Attributes/methods on session:", summary.get("dir"))
-                st.info(
-                    "Tip: Ensure the latest Hydro‑Quebec API Wrapper (`Hydro-Quebec-API-Wrapper`) is installed. "
-                    "Some versions rely on customer/account/contract IDs (from your invoice)."
-                )
+        with st.expander("Raw billing JSON (get_info)"):
+            st.json(raw_info)
+        with st.expander("Raw customers JSON (fetch_customers_info)"):
+            st.json(raw_customers)
+        with st.expander("Raw customers property (customers)"):
+            st.json(raw_customers_prop)
+
+        df_billing = normalize_billing([raw_info, raw_customers, raw_customers_prop])
+
+        st.subheader("Balances & due dates (normalized)")
+        if df_billing.empty:
+            st.info("Could not normalize billing fields automatically. See raw JSON above.")
         else:
-            raw = summary.get("raw")
-            st.write("Billing source:", summary.get("source"))
-            st.write("Raw billing data:")
-            st.json(raw)
-
-            df_billing = normalize_billing_rows(raw)
-            st.subheader("Balances & due dates (normalized)")
-            if df_billing.empty:
-                st.info("Could not normalize billing fields automatically. See raw data above.")
-            else:
-                st.dataframe(df_billing, use_container_width=True)
+            st.dataframe(df_billing, use_container_width=True)
 
     st.markdown(
         """
         **Notes**  
-        • `hydroq-api` focuses on consumption retrieval (hourly/daily/monthly).  
-        • `hydroqc` provides broader account/customer/contract/webuser flows (used here for billing).  
+        • `hydroq-api` focuses on consumption retrieval (hourly/daily/monthly). [3](https://pypi.org/project/hydroq-api/)  
+        • `hydroqc` can retrieve general account/billing information via the customer portal (e.g., current balance and billing period projection). [1](https://hydroqc.ca/en/docs/overview/)[2](https://gitlab.com/hydroqc/hydroqc-docs/-/blob/main/content/en/docs/Overview/_index.md)  
         """
     )
