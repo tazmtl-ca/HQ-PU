@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
 from hydroq_api import HydroQuebec
-import requests  # for HTTPError handling
+import requests  # HTTPError handling
 import json
 from typing import Tuple, Any, Dict, List
 
@@ -15,7 +15,7 @@ st.set_page_config(page_title="Hydro‑Québec Usage & Billing", page_icon="⚡"
 st.title("⚡ Hydro‑Québec Usage & Billing")
 
 # ------------------------------------------------------------------------------
-# Helpers: Monthly parsing + column normalization (from previous step)
+# Helpers: Monthly parsing + column normalization
 # ------------------------------------------------------------------------------
 def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -24,28 +24,27 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
         "compare": { ... last year's month ... },
         "courant": { ... current month's data ... }
       }
-    Returns (df_monthly_current, df_monthly_compare)
+    Returns (df_monthly_current, df_monthly_compare) with columns:
+      month, kwh, start_date, end_date, avg_kwh_per_day, avg_temp
     """
     if df_raw is None or df_raw.empty or "results" not in df_raw.columns:
         return pd.DataFrame(), pd.DataFrame()
 
-    current_rows = []
-    compare_rows = []
+    current_rows: List[Dict[str, Any]] = []
+    compare_rows: List[Dict[str, Any]] = []
 
     for _, row in df_raw.iterrows():
         try:
             payload = row["results"]
             if isinstance(payload, str):
                 payload = json.loads(payload)
-            elif isinstance(payload, dict):
-                pass
-            else:
+            elif not isinstance(payload, dict):
                 continue
 
             cur = payload.get("courant") or {}
             cmp = payload.get("compare") or {}
 
-            # Current
+            # Current year
             cur_start = cur.get("dateDebutMois")
             cur_end   = cur.get("dateFinMois")
             cur_total = cur.get("consoTotalMois")
@@ -62,7 +61,7 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
                     "avg_temp": cur_temp,
                 })
 
-            # Compare (prior year)
+            # Same month last year (compare)
             cmp_start = cmp.get("dateDebutMois")
             cmp_end   = cmp.get("dateFinMois")
             cmp_total = cmp.get("consoTotalMois")
@@ -99,7 +98,7 @@ def normalize_usage_df(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
     date_candidates_daily  = ["date", "jour", "day", "periode", "period"]
     ts_candidates_hourly   = ["timestamp", "time", "datetime", "heure", "period", "periode"]
 
-    def first_existing(cands):
+    def first_existing(cands: List[str]) -> Any:
         for c in cands:
             if c in df.columns:
                 return c
@@ -155,6 +154,11 @@ if not email or not password:
     st.error("Missing HQ_EMAIL / HQ_PASSWORD secrets in Streamlit Cloud.")
     st.stop()
 
+# Optional identifiers that some hydroqc billing flows use (from your invoice)
+cust_id = st.secrets.get("HQ_CUSTOMER_ID")
+acct_id = st.secrets.get("HQ_ACCOUNT_ID")
+ctrt_id = st.secrets.get("HQ_CONTRACT_ID")
+
 # ------------------------------------------------------------------------------
 # UI: Tabs
 # ------------------------------------------------------------------------------
@@ -162,7 +166,7 @@ tabs = st.tabs(["Usage", "Billing"])
 usage_tab, billing_tab = tabs
 
 # ------------------------------------------------------------------------------
-# Usage tab controls (same as before)
+# Usage tab controls
 # ------------------------------------------------------------------------------
 with usage_tab:
     st.subheader("Selection")
@@ -193,25 +197,27 @@ with usage_tab:
 def get_hydroqapi_client(_email: str, _password: str) -> HydroQuebec:
     """
     hydroq-api: simple wrapper for usage (hourly/daily/monthly).
-    This library focuses on consumption data; invoices are not documented here. [1](https://github.com/hydrohub2/Hydroq)[2](https://github.com/homas01123/HydroQ)
     """
     client = HydroQuebec(_email, _password)
     client.login()
     return client
 
 @st.cache_data(ttl=600, show_spinner="Fetching hourly usage…")
-def fetch_hourly_df():
-    data = usage_client.get_hourly_usage()
+def fetch_hourly_df(_email: str, _password: str):
+    client = get_hydroqapi_client(_email, _password)
+    data = client.get_hourly_usage()
     return pd.DataFrame(data)
 
 @st.cache_data(ttl=600, show_spinner="Fetching daily usage…")
-def fetch_daily_df(start_iso: str, end_iso: str):
-    data = usage_client.get_daily_usage(start_iso, end_iso)
+def fetch_daily_df(_email: str, _password: str, start_iso: str, end_iso: str):
+    client = get_hydroqapi_client(_email, _password)
+    data = client.get_daily_usage(start_iso, end_iso)
     return pd.DataFrame(data)
 
 @st.cache_data(ttl=600, show_spinner="Fetching monthly usage…")
-def fetch_monthly_df():
-    data = usage_client.get_monthly_usage()
+def fetch_monthly_df(_email: str, _password: str):
+    client = get_hydroqapi_client(_email, _password)
+    data = client.get_monthly_usage()
     return pd.DataFrame(data)
 
 def show_http_error(prefix: str, err: requests.exceptions.HTTPError):
@@ -239,7 +245,8 @@ with usage_tab:
             st.stop()
 
         try:
-            usage_client = get_hydroqapi_client(email, password)
+            # Ensure client is created; also confirms login credentials
+            _ = get_hydroqapi_client(email, password)
             st.caption("Logged in (usage).")
         except requests.exceptions.HTTPError as http_err:
             show_http_error("Login (usage)", http_err)
@@ -250,7 +257,7 @@ with usage_tab:
 
         try:
             if granularity == "Hourly":
-                df = fetch_hourly_df()
+                df = fetch_hourly_df(email, password)
                 df = normalize_usage_df(df, "Hourly")
 
                 st.subheader("Hourly usage (last 24h)")
@@ -263,7 +270,7 @@ with usage_tab:
                     st.info("Hourly data columns differ; showing normalized table above.")
 
             elif granularity == "Daily":
-                df = fetch_daily_df(start_date.isoformat(), end_date.isoformat())
+                df = fetch_daily_df(email, password, start_date.isoformat(), end_date.isoformat())
                 df = normalize_usage_df(df, "Daily")
 
                 st.subheader(f"Daily usage ({start_date} → {end_date})")
@@ -276,7 +283,7 @@ with usage_tab:
                     st.info("Daily data columns differ; showing normalized table above.")
 
             else:  # Monthly
-                df_api = fetch_monthly_df()
+                df_api = fetch_monthly_df(email, password)
 
                 with st.expander("Raw monthly API payload (first 10 rows)"):
                     st.write("Shape:", df_api.shape)
@@ -314,22 +321,15 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
-
 # ------------------------------------------------------------------------------
 # Billing tab (balances & due dates) via hydroqc
 # ------------------------------------------------------------------------------
 with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
-
     st.caption(
         "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) for account & billing. "
         "Usage remains powered by `hydroq-api`."
     )
-
-    # Optional IDs from secrets (improve billing calls on some hydroqc versions)
-    cust_id = st.secrets.get("HQ_CUSTOMER_ID")
-    acct_id = st.secrets.get("HQ_ACCOUNT_ID")
-    ctrt_id = st.secrets.get("HQ_CONTRACT_ID")
 
     @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
     def get_hydroqc_session(_email: str, _password: str):
@@ -337,21 +337,17 @@ with billing_tab:
         Build a hydroqc session. Try multiple constructor signatures because they vary by version:
         - WebUser(email, password, verify_ssl=True)
         - WebUser(email, password)
-        - HydroClient(email, password)
+        - HydroClient(email, password) or HydroClient() + login
         Attach customer/account/contract identifiers when available.
         """
-        # Import inside function so the app can run even if hydroqc isn't installed yet
         try:
             from hydroqc.webuser import WebUser  # type: ignore
             try:
-                # Most recent builds expect verify_ssl as a positional argument
-                user = WebUser(_email, _password, True)
+                user = WebUser(_email, _password, True)  # newer builds: verify_ssl required
             except TypeError:
-                # Older builds: no verify_ssl in signature
-                user = WebUser(_email, _password)
-            # Login
+                user = WebUser(_email, _password)        # older builds
             user.login()
-            # Attach identifiers if the object supports them
+            # Attach identifiers if supported
             if cust_id and hasattr(user, "customer"):
                 try: setattr(user, "customer", cust_id)
                 except Exception: pass
@@ -363,17 +359,14 @@ with billing_tab:
                 except Exception: pass
             return user
         except Exception as e_webuser:
-            # Fallback to HydroClient form
             try:
                 from hydroqc.hydro_api.client import HydroClient  # type: ignore
                 try:
                     client = HydroClient(_email, _password)
                 except TypeError:
-                    # Last resort: if constructor needs only username, we try login later
                     client = HydroClient()
                     if hasattr(client, "login"):
                         client.login(_email, _password)
-                # Attach identifiers if the object supports them
                 for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
                     if value and hasattr(client, name):
                         try: setattr(client, name, value)
@@ -385,15 +378,16 @@ with billing_tab:
                     f"WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    def try_get_billing_summary(hq_obj):
+    def try_get_billing_summary(hq_obj: Any) -> Dict[str, Any]:
         """
         Attempt to fetch balance & due date across hydroqc versions.
-        We probe common methods on root and nested modules (account/customer/contract/contracts).
+        Probe common methods on root and nested modules (account/customer/contract/contracts).
         """
         candidates = [
             "get_balance", "get_billing_info", "get_current_invoice",
             "get_invoices", "billing_summary",
         ]
+
         # Direct calls on the root object
         for name in candidates:
             if hasattr(hq_obj, name):
@@ -406,7 +400,6 @@ with billing_tab:
         for attr in ["account", "customer", "contract", "contracts"]:
             if hasattr(hq_obj, attr):
                 obj = getattr(hq_obj, attr)
-                # If it's callable, call it; might return a dict summary
                 if callable(obj):
                     try:
                         data = obj()
@@ -414,7 +407,7 @@ with billing_tab:
                             return {"source": f"{attr}()", "raw": data}
                     except Exception:
                         pass
-                # Try candidate methods on nested object(s)
+
                 if isinstance(obj, (list, tuple)):
                     found = []
                     for i, elem in enumerate(obj):
@@ -434,20 +427,20 @@ with billing_tab:
                                 return {"source": f"{attr}.{name}", "raw": getattr(obj, name)()}
                             except Exception:
                                 pass
+
         return {"error": "No billing method found.", "dir": dir(hq_obj)}
 
-    def normalize_billing_rows(raw):
+    def normalize_billing_rows(raw: Any) -> pd.DataFrame:
         """
         Convert various shapes to rows with 'amount' and 'due_date' keys.
         """
-        rows = []
+        rows: List[Dict[str, Any]] = []
 
-        def pick_amount_and_due(d: dict):
+        def pick_amount_and_due(d: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(d, dict): return {}
-            # try common keys (case-insensitive)
             lower = {k.lower(): k for k in d.keys()}
-            amt_key = next((lower[k] for k in lower if "amount" in k or "balance" in k), None)
-            due_key = next((lower[k] for k in lower if "due" in k and "date" in k), None)
+            amt_key = next((lower[k] for k in lower if ("amount" in k or "balance" in k)), None)
+            due_key = next((lower[k] for k in lower if ("due" in k and "date" in k)), None)
             return {
                 "amount": d.get(amt_key) if amt_key else None,
                 "due_date": d.get(due_key) if due_key else None,
@@ -466,6 +459,7 @@ with billing_tab:
                             if isinstance(v, dict): rows.append(pick_amount_and_due(v))
                 elif isinstance(elem, dict):
                     rows.append(pick_amount_and_due(elem))
+
         return pd.DataFrame(rows)
 
     # UI: RUN button for billing
@@ -493,8 +487,7 @@ with billing_tab:
                 st.write("Attributes/methods on session:", summary.get("dir"))
                 st.info(
                     "Tip: Ensure the latest Hydro‑Quebec API Wrapper (`Hydro-Quebec-API-Wrapper`) is installed. "
-                    "Some versions rely on customer/account/contract IDs (from your invoice). "
-                    "See hydroqc configuration docs for field names."  # customer/account/contract
+                    "Some versions rely on customer/account/contract IDs (from your invoice)."
                 )
         else:
             raw = summary.get("raw")
@@ -509,14 +502,10 @@ with billing_tab:
             else:
                 st.dataframe(df_billing, use_container_width=True)
 
-    # References/notes
     st.markdown(
         """
         **Notes**  
-        • `hydroq-api` is for consumption; invoices/billing are not documented in that library.  
-        • `hydroqc` provides broader account/customer/contract/webuser flows; see docs & config guide.  
+        • `hydroq-api` focuses on consumption retrieval (hourly/daily/monthly).  
+        • `hydroqc` provides broader account/customer/contract/webuser flows (used here for billing).  
         """
-    )
-    st.caption(
-        "References: hydroq-api on PyPI/GitHub; hydroqc on PyPI and docs."
     )
