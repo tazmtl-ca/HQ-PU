@@ -226,163 +226,159 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
-# ------------------------------------------------------------------------------
-# Billing tab — build a fresh hydroqc session per RUN (no cache), async aware
-# ------------------------------------------------------------------------------
-with billing_tab:
-    st.subheader("Balances & Due Dates (via hydroqc)")
-    st.caption(
-        "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) for account & billing. "
-        "We create a fresh session per RUN because Streamlit does not support caching async objects. "
-        "If you change Secrets, click RUN again."  # cite turn5search25 turn5search34
-    )
 
-    # Async helpers
-    def run_coro(coro):
+# --- Billing Run UI ---
+col_b1, col_b2 = st.columns([1, 1])
+with col_b1:
+    run_billing = st.button("▶️ RUN (Billing)")
+with col_b2:
+    if st.button("ℹ️ Runtime info"):
+        import sys, importlib
+        st.write("Python:", sys.version)
         try:
-            return asyncio.run(coro)
-        except RuntimeError:
-            result_container, error_container = {}, {}
-            def runner():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try: result_container["result"] = loop.run_until_complete(coro)
-                except Exception as e: error_container["error"] = e
-                finally: loop.close()
-            t = threading.Thread(target=runner); t.start(); t.join()
-            if "error" in error_container: raise error_container["error"]
-            return result_container.get("result")
-
-    def call_hydroqc_once(obj: Any, method_name: str) -> Any:
-        if not hasattr(obj, method_name): raise AttributeError(f"{method_name} not found on session.")
-        m = getattr(obj, method_name)
-        sig = inspect.signature(m); kwargs = {}
-        for pname in sig.parameters.keys():
-            p = pname.lower()
-            if p in {"customer", "customer_id"} and cust_id: kwargs[pname] = cust_id
-            if p in {"account", "account_id"} and acct_id: kwargs[pname] = acct_id
-            if p in {"contract", "contract_id"} and ctrt_id: kwargs[pname] = ctrt_id
-            if p in {"verify_ssl"}: kwargs[pname] = True
-        res = m(**kwargs) if sig.parameters else m()
-        return run_coro(res) if inspect.iscoroutine(res) else res
-
-    # Build a fresh session each RUN (no cache)
-    def new_hydroqc_session(_email: str, _password: str):
-        try:
-            from hydroqc.webuser import WebUser  # type: ignore
-            try: user = WebUser(_email, _password, True)  # some builds require verify_ssl
-            except TypeError: user = WebUser(_email, _password)
-            login_res = user.login()
-            if inspect.iscoroutine(login_res): run_coro(login_res)
-            # attach IDs if attributes exist
-            for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
-                if value and hasattr(user, name):
-                    try: setattr(user, name, value)
-                    except Exception: pass
-            return user
-        except Exception as e_webuser:
-            from hydroqc.hydro_api.client import HydroClient  # type: ignore
-            try:
-                try: client = HydroClient(_email, _password)
-                except TypeError:
-                    client = HydroClient()
-                    if hasattr(client, "login"):
-                        login_res = client.login(_email, _password)
-                        if inspect.iscoroutine(login_res): run_coro(login_res)
-                for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
-                    if value and hasattr(client, name):
-                        try: setattr(client, name, value)
-                        except Exception: pass
-                return client
-            except Exception as e_client:
-                raise RuntimeError(f"hydroqc session init failed: WebUser error: {e_webuser}; HydroClient error: {e_client}")
-
-    # UI: RUN (Billing)
-    col_b1, col_b2 = st.columns([1, 1])
-    with col_b1: run_billing = st.button("▶️ RUN (Billing)")
-    with col_b2:
-        if st.button("ℹ️ Runtime info"):
-            import sys, importlib
-            st.write("Python:", sys.version)
-            try:
-                import hydroqc
-                st.write("hydroqc version:", getattr(hydroqc, "__version__", "unknown"))
-                st.write("has WebUser:", bool(importlib.util.find_spec("hydroqc.webuser")))
-            except Exception as e: st.write("hydroqc import error:", e)
-
-    if run_billing:
-        try:
-            hq_session = new_hydroqc_session(email, password)
-            st.caption("Logged in (billing). Fresh session created.")
+            import hydroqc
+            st.write("hydroqc version:", getattr(hydroqc, "__version__", "unknown"))
+            st.write("has WebUser:", bool(importlib.util.find_spec("hydroqc.webuser")))
         except Exception as e:
-            st.error(f"hydroqc login failed: {e}"); st.stop()
+            st.write("hydroqc import error:", e)
 
-        # Focus on customer info calls (avoid re-calling other portal checks)
-        portal_status = None  # optional; can be flaky, skip to avoid async reuse
-        try:
-            raw_customers = call_hydroqc_once(hq_session, "fetch_customers_info")
-        except Exception as e:
-            st.error(f"fetch_customers_info error: {e}")
-            raw_customers = None
+if run_billing:
+    # 1) New session (fresh each run)
+    try:
+        hq_session = new_hydroqc_session(email, password)
+        st.caption("Logged in (billing). Fresh session created.")
+    except Exception as e:
+        st.error(f"hydroqc login failed: {e}")
+        st.stop()
 
-        try:
-            raw_customer = call_hydroqc_once(hq_session, "get_customer")  # passes customer_id via signature
-        except Exception as e:
-            st.error(f"get_customer error: {e}")
-            raw_customer = None
+    # 2) Fetch customers from the portal (async-aware)
+    try:
+        customers_raw = call_hydroqc_once(hq_session, "fetch_customers_info")
+    except Exception as e:
+        st.error(f"fetch_customers_info error: {e}")
+        customers_raw = None
 
-        # Show raw values (no st.json unless it's dict/list)
-        with st.expander("fetch_customers_info (raw)"):
-            if isinstance(raw_customers, (dict, list)): st.json(raw_customers)
-            else: st.write(type(raw_customers).__name__, raw_customers)
-
-        with st.expander("get_customer (raw)"):
-            if isinstance(raw_customer, (dict, list)): st.json(raw_customer)
-            else: st.write(type(raw_customer).__name__, raw_customer)
-
-        # Normalize common billing keys
-        def deep_find_items(obj) -> List[Dict[str, Any]]:
-            found: List[Dict[str, Any]] = []
-            amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
-            due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
-            def norm(k: str) -> str: return k.replace("_", "").replace("-", "").lower()
-            def walk(x):
-                if isinstance(x, dict):
-                    lower = {norm(k): k for k in x}
-                    amt_k = next((lower[k] for k in lower if k in amount_keys), None)
-                    due_k = next((lower[k] for k in lower if k in due_keys), None)
-                    if amt_k or due_k:
-                        rec = {"amount": x.get(amt_k) if amt_k else None,
-                               "due_date": x.get(due_k) if due_k else None}
-                        for id_key in ["contract","numeroContrat","contractId","account","compte","accountId","customer","client","customerId"]:
-                            if id_key in x: rec[id_key] = x.get(id_key)
-                        found.append(rec)
-                    for v in x.values(): walk(v)
-                elif isinstance(x, (list, tuple)):
-                    for v in x: walk(v)
-            walk(obj)
-            return found
-
-        rows = []
-        for raw in [raw_customers, raw_customer]:
-            if isinstance(raw, (dict, list)): rows += deep_find_items(raw)
-            elif isinstance(raw, str):
-                try: rows += deep_find_items(json.loads(raw))
-                except Exception: pass
-
-        df_billing = pd.DataFrame(rows).drop_duplicates() if rows else pd.DataFrame()
-        if "amount" in df_billing.columns:
-            try: df_billing["amount"] = pd.to_numeric(df_billing["amount"], errors="coerce")
-            except Exception: pass
-        if "due_date" in df_billing.columns:
-            try:
-                df_billing["due_date"] = pd.to_datetime(df_billing["due_date"], errors="coerce")
-                df_billing = df_billing.sort_values("due_date", na_position="last")
-            except Exception: pass
-
-        st.subheader("Balances & due dates (normalized)")
-        if df_billing.empty:
-            st.info("No billing fields found yet. If you still see 'Customer ... not found', double‑check that "
-                    "HQ_CUSTOMER_ID in Secrets is the exact 10‑digit 'Numéro de facture' from your invoice (leading 0 if needed).")
+    # Show raw customers payload (helpful to verify fields)
+    with st.expander("fetch_customers_info (raw)"):
+        if isinstance(customers_raw, (dict, list)):
+            st.json(customers_raw)
         else:
-            st.dataframe(df_billing, use_container_width=True)
+            st.write(type(customers_raw).__name__, customers_raw)
+
+    # 3) Extract candidate customer IDs from the portal payload
+    def find_customer_ids(obj) -> List[Dict[str, str]]:
+        """
+        Aggressively search dict/list for likely customer identifiers and labels.
+        Returns [{'id': '...', 'label': '...'}].
+        """
+        pool: List[Dict[str, str]] = []
+
+        id_keys = {
+            "customerid", "idcustomer", "idclient", "customer", "client",
+            "numeroclient", "numclient", "noclient", "numero", "id"
+        }
+        name_keys = {"name", "firstname", "first_name", "lastname", "last_name"}
+
+        def norm(s: str) -> str:
+            return s.replace("_", "").replace("-", "").lower()
+
+        def walk(x):
+            if isinstance(x, dict):
+                # capture an entry if it looks like a customer node
+                lk = {norm(k): k for k in x.keys()}
+                id_key = next((lk[k] for k in id_keys if k in lk), None)
+                if id_key:
+                    cid = str(x.get(id_key, "")).strip()
+                    # build label from name fields if available
+                    parts = []
+                    for k in name_keys:
+                        if k in lk and x.get(lk[k]): parts.append(str(x.get(lk[k])))
+                    label = " ".join(parts) if parts else cid
+                    if cid:
+                        pool.append({"id": cid, "label": label})
+                # continue walking
+                for v in x.values(): walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x: walk(v)
+
+        walk(obj)
+        # de-duplicate
+        uniq = {}
+        for item in pool:
+            uniq[item["id"]] = item["label"]
+        return [{"id": k, "label": v} for k, v in uniq.items()]
+
+    candidates = find_customer_ids(customers_raw) if customers_raw else []
+    if not candidates:
+        st.warning("No customer IDs returned by the portal. If this persists, verify your login and try again later (the portal sometimes has maintenance windows).")
+        st.stop()
+
+    # 4) Let you choose the customer ID we’ll pass to get_customer()
+    st.subheader("Choose customer ID from the portal")
+    chosen_label = st.selectbox(
+        "Customer",
+        options=[c["label"] for c in candidates],
+        index=0
+    )
+    chosen_id = next(c["id"] for c in candidates if c["label"] == chosen_label)
+
+    # 5) Call get_customer(customer_id=chosen_id)
+    try:
+        # Force a single call with the chosen ID, avoid multiple awaits
+        m = getattr(hq_session, "get_customer")
+        res = m(customer_id=chosen_id)
+        raw_customer = run_coro(res) if inspect.iscoroutine(res) else res
+    except Exception as e:
+        st.error(f"get_customer({chosen_id}) error: {e}")
+        raw_customer = None
+
+    with st.expander("get_customer (raw)"):
+        if isinstance(raw_customer, (dict, list)):
+            st.json(raw_customer)
+        else:
+            st.write(type(raw_customer).__name__, raw_customer)
+
+    # 6) Normalize common billing keys into Amount/Due date table
+    def deep_find_items(obj) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
+        due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
+        def norm(k: str) -> str: return k.replace("_", "").replace("-", "").lower()
+        def walk(x):
+            if isinstance(x, dict):
+                lower = {norm(k): k for k in x}
+                amt_k = next((lower[k] for k in lower if k in amount_keys), None)
+                due_k = next((lower[k] for k in lower if k in due_keys), None)
+                if amt_k or due_k:
+                    rec = {"amount": x.get(amt_k) if amt_k else None, "due_date": x.get(due_k) if due_k else None}
+                    for id_key in ["contract","numeroContrat","contractId","account","compte","accountId","customer","client","customerId"]:
+                        if id_key in x: rec[id_key] = x.get(id_key)
+                    found.append(rec)
+                for v in x.values(): walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x: walk(v)
+        walk(obj)
+        return found
+
+    rows = []
+    for raw in [customers_raw, raw_customer]:
+        if isinstance(raw, (dict, list)): rows += deep_find_items(raw)
+        elif isinstance(raw, str):
+            try: rows += deep_find_items(json.loads(raw))
+            except Exception: pass
+
+    df_billing = pd.DataFrame(rows).drop_duplicates() if rows else pd.DataFrame()
+    if "amount" in df_billing.columns:
+        try: df_billing["amount"] = pd.to_numeric(df_billing["amount"], errors="coerce")
+        except Exception: pass
+    if "due_date" in df_billing.columns:
+        try:
+            df_billing["due_date"] = pd.to_datetime(df_billing["due_date"], errors="coerce")
+            df_billing = df_billing.sort_values("due_date", na_position="last")
+        except Exception: pass
+
+    st.subheader("Balances & due dates (normalized)")
+    if df_billing.empty:
+        st.info("No billing fields found yet. If you selected a customer ID and still see no details, try another customer entry or retry later.")
+    else:
+        st.dataframe(df_billing, use_container_width=True)
