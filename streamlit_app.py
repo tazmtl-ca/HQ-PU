@@ -7,6 +7,9 @@ from hydroq_api import HydroQuebec
 import requests  # HTTPError handling
 import json
 from typing import Tuple, Any, Dict, List, Optional
+import asyncio
+import inspect
+import threading
 
 # ------------------------------------------------------------------------------
 # Page config
@@ -15,15 +18,15 @@ st.set_page_config(page_title="Hydro‑Québec Usage & Billing", page_icon="⚡"
 st.title("⚡ Hydro‑Québec Usage & Billing")
 
 # ------------------------------------------------------------------------------
-# Helpers: Monthly parsing + column normalization
+# Helpers: Monthly parsing + column normalization (usage side)
 # ------------------------------------------------------------------------------
 def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Parse a DataFrame that has a 'results' column of JSON strings where each row contains:
-      {
-        "compare": { ... last year's month ... },
-        "courant": { ... current month's data ... }
-      }
+    {
+      "compare": {...},
+      "courant": {...}
+    }
     Returns (df_monthly_current, df_monthly_compare).
     """
     if df_raw is None or df_raw.empty or "results" not in df_raw.columns:
@@ -311,9 +314,8 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
-
 # ------------------------------------------------------------------------------
-# Billing tab (balances & due dates) via hydroqc — robust JSON coercion & flexible calls
+# Billing tab (balances & due dates) via hydroqc — async aware
 # ------------------------------------------------------------------------------
 with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
@@ -322,6 +324,29 @@ with billing_tab:
         "Usage remains powered by `hydroq-api` (consumption only)."
     )
 
+    # --- Async helpers ---
+    def run_coro(coro):
+        """Run a coroutine safely in Streamlit."""
+        try:
+            return asyncio.run(coro)
+        except RuntimeError:
+            # If an event loop is already running, run in a separate thread with a new loop
+            result_container: Dict[str, Any] = {}
+            def runner():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result_container["result"] = loop.run_until_complete(coro)
+                loop.close()
+            t = threading.Thread(target=runner)
+            t.start(); t.join()
+            return result_container.get("result")
+
+    def maybe_call_async(func, *args, **kwargs):
+        """Call a function; if it returns a coroutine, await it."""
+        res = func(*args, **kwargs)
+        return run_coro(res) if inspect.iscoroutine(res) else res
+
+    # --- Build hydroqc session (robust across versions) ---
     @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
     def get_hydroqc_session(_email: str, _password: str):
         """
@@ -335,7 +360,8 @@ with billing_tab:
                 user = WebUser(_email, _password, True)  # some builds require verify_ssl
             except TypeError:
                 user = WebUser(_email, _password)
-            user.login()
+            # login may be async
+            maybe_call_async(user.login)
             for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
                 if value and hasattr(user, name):
                     try: setattr(user, name, value)
@@ -349,7 +375,7 @@ with billing_tab:
                 except TypeError:
                     client = HydroClient()
                     if hasattr(client, "login"):
-                        client.login(_email, _password)
+                        maybe_call_async(client.login, _email, _password)
                 for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
                     if value and hasattr(client, name):
                         try: setattr(client, name, value)
@@ -360,57 +386,48 @@ with billing_tab:
                     f"Unable to initialize hydroqc session. WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    # --- Utilities: coercion & flexible method caller ---
-    import inspect
+    # --- Coercion and flexible calls ---
     def coerce_to_jsonlike(x: Any) -> Any:
-        """Best effort: return dict/list if possible; else return the original for st.write()."""
+        """Best effort: dict/list if possible; else original for st.write()."""
         if x is None:
             return None
-        # If it's already a dict/list/tuple, OK
         if isinstance(x, (dict, list, tuple)):
             return x
-        # String that might be JSON
         if isinstance(x, str):
             try:
                 return json.loads(x)
             except Exception:
-                return x  # not JSON; show raw string
-        # If object has a __dict__, use it
+                return x
         if hasattr(x, "__dict__"):
             try:
                 d = vars(x).copy()
-                # Avoid recursive issues; drop callables
                 for k, v in list(d.items()):
-                    if callable(v):
-                        d.pop(k, None)
+                    if callable(v): d.pop(k, None)
                 return d
             except Exception:
                 pass
-        # Fallback: return original; st.write will show type/value
         return x
 
     def flexible_call(obj: Any, method_name: str) -> Any:
-        """
-        Call obj.method_name with invoice identifiers if the signature supports them.
-        Tries (no args) first, then kwargs from known names.
-        """
+        """Call obj.method_name and await if needed; pass IDs if signature supports them."""
         if not hasattr(obj, method_name):
             return None
         m = getattr(obj, method_name)
         try:
-            return m()  # no-arg call
+            res = m()  # try no-arg call
+            return run_coro(res) if inspect.iscoroutine(res) else res
         except TypeError:
             try:
                 sig = inspect.signature(m)
                 kwargs = {}
-                # Map our secrets to common parameter names
                 for pname in sig.parameters.keys():
                     p = pname.lower()
                     if p in {"customer", "customer_id"} and cust_id: kwargs[pname] = cust_id
                     if p in {"account", "account_id"} and acct_id: kwargs[pname] = acct_id
                     if p in {"contract", "contract_id"} and ctrt_id: kwargs[pname] = ctrt_id
                     if p in {"verify_ssl"}: kwargs[pname] = True
-                return m(**kwargs)
+                res = m(**kwargs)
+                return run_coro(res) if inspect.iscoroutine(res) else res
             except Exception:
                 return None
 
@@ -436,7 +453,6 @@ with billing_tab:
                         "amount": x.get(amt_k) if amt_k else None,
                         "due_date": x.get(due_k) if due_k else None,
                     }
-                    # capture identifiers if present
                     for id_key in ["contract", "numeroContrat", "contractId", "account", "compte", "accountId", "customer", "client", "customerId"]:
                         if id_key in x:
                             rec[id_key] = x.get(id_key)
@@ -456,11 +472,9 @@ with billing_tab:
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).drop_duplicates()
-        # numeric amount
         if "amount" in df.columns:
             try: df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
             except Exception: pass
-        # sort by due_date
         if "due_date" in df.columns:
             try:
                 df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
@@ -485,15 +499,14 @@ with billing_tab:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        # Prefer methods your session exposes
-        # (based on your attribute list: check_hq_portal_status, get_info, fetch_customers_info, get_customer)
+        # Call/await the methods your session exposes
         portal_status = flexible_call(hq_session, "check_hq_portal_status")
         raw_info      = flexible_call(hq_session, "get_info")
         raw_customers = flexible_call(hq_session, "fetch_customers_info")
-        raw_customer1 = flexible_call(hq_session, "get_customer")  # sometimes singular record
+        raw_customer1 = flexible_call(hq_session, "get_customer")  # singular record (some versions)
 
-        # Show raw values safely (write, not json)
-        with st.expander("Portal status"):
+        # Show raw values safely
+        with st.expander("Portal status (raw)"):
             st.write(type(portal_status).__name__, portal_status)
         with st.expander("get_info (raw)"):
             st.write(type(raw_info).__name__, raw_info)
@@ -508,17 +521,19 @@ with billing_tab:
 
         st.subheader("Balances & due dates (normalized)")
         if df_billing.empty:
-            st.info("Could not normalize billing fields automatically. Try clicking each expander above to inspect the raw values. "
-                    "If you see exact keys for amount/due date (e.g., 'solde', 'montantFacture', 'dateEcheance'), tell me and I'll add them.")
+            st.info(
+                "Could not normalize billing fields automatically. Inspect the raw outputs above and share any "
+                "balance/amount and due‑date keys you see (e.g., 'solde', 'montantFacture', 'dateEcheance'); "
+                "I’ll add precise mappings."
+            )
         else:
             st.dataframe(df_billing, use_container_width=True)
 
     st.markdown(
         """
         **Notes**  
-        • `st.json` renders valid JSON (dict/list or JSON strings). If a method returns a non‑JSON object,
-          prefer `st.write` or coerce to a dict first. [1](https://docs.streamlit.io/develop/api-reference/data/st.json)  
-        • `hydroq-api` focuses on consumption (hourly/daily/monthly). [2](https://docs.streamlit.io/develop/api-reference/status/st.error)  
-        • `hydroqc` can return general account info via the portal (balance, billing period projection); shapes vary by version. [3](https://github.com/homas01123/HydroQ)[4](https://github.com/hydrohub2/Hydroq)
+        • `st.json` renders valid JSON (dict/list or JSON strings). If a method returns a coroutine or a non‑JSON object, prefer `st.write` or coerce it first. [1](https://github.com/lvg77/hydroq-api/releases)  
+        • Caching async objects/functions is not supported by Streamlit; we avoid caching awaited results and only cache the session resource. [2](https://hydroqc.readthedocs.io/en/latest/reference/hydroqc.hydro_api.html)[3](https://gitlab.com/hydroqc/hydroqc/-/blob/main/README.md)  
+        • `hydroq-api` focuses on consumption (hourly/daily/monthly), while `hydroqc` retrieves broader account info (balance, billing period projection). [4](https://github.com/hydrohub2/Hydroq)[5](https://procodebase.com/article/integrating-apis-with-streamlit-applications)
         """
     )
