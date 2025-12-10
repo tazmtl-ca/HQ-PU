@@ -311,8 +311,9 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
+
 # ------------------------------------------------------------------------------
-# Billing tab (balances & due dates) via hydroqc
+# Billing tab (balances & due dates) via hydroqc — robust JSON coercion & flexible calls
 # ------------------------------------------------------------------------------
 with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
@@ -321,7 +322,6 @@ with billing_tab:
         "Usage remains powered by `hydroq-api` (consumption only)."
     )
 
-    # --- Build hydroqc session (robust across versions) ---
     @st.cache_resource(ttl="1h", show_spinner="Connecting to Hydro‑Québec (billing)…")
     def get_hydroqc_session(_email: str, _password: str):
         """
@@ -360,79 +360,112 @@ with billing_tab:
                     f"Unable to initialize hydroqc session. WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    # --- Extract billing from available methods/properties ---
-    def safe_call(obj, name) -> Any:
-        if hasattr(obj, name):
+    # --- Utilities: coercion & flexible method caller ---
+    import inspect
+    def coerce_to_jsonlike(x: Any) -> Any:
+        """Best effort: return dict/list if possible; else return the original for st.write()."""
+        if x is None:
+            return None
+        # If it's already a dict/list/tuple, OK
+        if isinstance(x, (dict, list, tuple)):
+            return x
+        # String that might be JSON
+        if isinstance(x, str):
             try:
-                return getattr(obj, name)()
+                return json.loads(x)
+            except Exception:
+                return x  # not JSON; show raw string
+        # If object has a __dict__, use it
+        if hasattr(x, "__dict__"):
+            try:
+                d = vars(x).copy()
+                # Avoid recursive issues; drop callables
+                for k, v in list(d.items()):
+                    if callable(v):
+                        d.pop(k, None)
+                return d
+            except Exception:
+                pass
+        # Fallback: return original; st.write will show type/value
+        return x
+
+    def flexible_call(obj: Any, method_name: str) -> Any:
+        """
+        Call obj.method_name with invoice identifiers if the signature supports them.
+        Tries (no args) first, then kwargs from known names.
+        """
+        if not hasattr(obj, method_name):
+            return None
+        m = getattr(obj, method_name)
+        try:
+            return m()  # no-arg call
+        except TypeError:
+            try:
+                sig = inspect.signature(m)
+                kwargs = {}
+                # Map our secrets to common parameter names
+                for pname in sig.parameters.keys():
+                    p = pname.lower()
+                    if p in {"customer", "customer_id"} and cust_id: kwargs[pname] = cust_id
+                    if p in {"account", "account_id"} and acct_id: kwargs[pname] = acct_id
+                    if p in {"contract", "contract_id"} and ctrt_id: kwargs[pname] = ctrt_id
+                    if p in {"verify_ssl"}: kwargs[pname] = True
+                return m(**kwargs)
             except Exception:
                 return None
-        return None
 
     def deep_find_items(obj) -> List[Dict[str, Any]]:
         """
-        Recursively walk dict/list and extract candidate billing dicts that contain amount/balance and due date.
-        Supports English/French keys typically seen in HQ portal JSONs.
+        Recursively walk dict/list and extract candidate billing dicts that contain
+        amount/balance and due date. Supports English & French keys commonly seen.
         """
         found: List[Dict[str, Any]] = []
         amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
         due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
 
-        def has_any_key(d: Dict[str, Any], keys: set) -> Optional[str]:
-            for k in d.keys():
-                if k and isinstance(k, str) and k.replace("_", "").replace("-", "").lower() in keys:
-                    return k
-            return None
+        def normkey(k: str) -> str:
+            return k.replace("_", "").replace("-", "").lower()
 
         def walk(x):
             if isinstance(x, dict):
-                amt_k = has_any_key(x, amount_keys)
-                due_k = has_any_key(x, due_keys)
+                lower = {normkey(k): k for k in x.keys()}
+                amt_k = next((lower[k] for k in lower if k in amount_keys), None)
+                due_k = next((lower[k] for k in lower if k in due_keys), None)
                 if amt_k or due_k:
-                    # Keep a lightweight record with the best-matching fields
                     rec = {
                         "amount": x.get(amt_k) if amt_k else None,
                         "due_date": x.get(due_k) if due_k else None,
                     }
-                    # Try to capture contract or account identifiers if present
+                    # capture identifiers if present
                     for id_key in ["contract", "numeroContrat", "contractId", "account", "compte", "accountId", "customer", "client", "customerId"]:
                         if id_key in x:
                             rec[id_key] = x.get(id_key)
                     found.append(rec)
-                # Continue walking nested dicts/lists
                 for v in x.values(): walk(v)
-            elif isinstance(x, list):
+            elif isinstance(x, (list, tuple)):
                 for v in x: walk(v)
 
         walk(obj)
         return found
 
     def normalize_billing(raws: List[Any]) -> pd.DataFrame:
-        """
-        Merge multiple raw structures into a flat table with amount/due_date and identifiers if available.
-        """
         rows: List[Dict[str, Any]] = []
         for raw in raws:
-            rows.extend(deep_find_items(raw))
-        # Deduplicate rows that have same (amount, due_date)
+            j = coerce_to_jsonlike(raw)
+            rows.extend(deep_find_items(j))
         if not rows:
             return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        df = df.drop_duplicates()
-        # Convert amount to numeric if possible
-        for col in ["amount"]:
-            if col in df.columns:
-                try:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                except Exception:
-                    pass
-        # Sort by due_date if present
+        df = pd.DataFrame(rows).drop_duplicates()
+        # numeric amount
+        if "amount" in df.columns:
+            try: df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+            except Exception: pass
+        # sort by due_date
         if "due_date" in df.columns:
             try:
                 df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
                 df = df.sort_values("due_date", na_position="last")
-            except Exception:
-                pass
+            except Exception: pass
         return df
 
     # --- Billing Run UI ---
@@ -452,31 +485,40 @@ with billing_tab:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        # Prefer direct helpers first (seen in your attribute list)
-        raw_info      = safe_call(hq_session, "get_info")
-        raw_customers = safe_call(hq_session, "fetch_customers_info")
-        # Also check 'customers' attribute if populated (could be dict/list)
-        raw_customers_prop = getattr(hq_session, "customers", None)
+        # Prefer methods your session exposes
+        # (based on your attribute list: check_hq_portal_status, get_info, fetch_customers_info, get_customer)
+        portal_status = flexible_call(hq_session, "check_hq_portal_status")
+        raw_info      = flexible_call(hq_session, "get_info")
+        raw_customers = flexible_call(hq_session, "fetch_customers_info")
+        raw_customer1 = flexible_call(hq_session, "get_customer")  # sometimes singular record
 
-        with st.expander("Raw billing JSON (get_info)"):
-            st.json(raw_info)
-        with st.expander("Raw customers JSON (fetch_customers_info)"):
-            st.json(raw_customers)
-        with st.expander("Raw customers property (customers)"):
-            st.json(raw_customers_prop)
+        # Show raw values safely (write, not json)
+        with st.expander("Portal status"):
+            st.write(type(portal_status).__name__, portal_status)
+        with st.expander("get_info (raw)"):
+            st.write(type(raw_info).__name__, raw_info)
+        with st.expander("fetch_customers_info (raw)"):
+            st.write(type(raw_customers).__name__, raw_customers)
+        with st.expander("get_customer (raw)"):
+            st.write(type(raw_customer1).__name__, raw_customer1)
+        with st.expander("customers property (raw)"):
+            st.write(type(getattr(hq_session, "customers", None)).__name__, getattr(hq_session, "customers", None))
 
-        df_billing = normalize_billing([raw_info, raw_customers, raw_customers_prop])
+        df_billing = normalize_billing([portal_status, raw_info, raw_customers, raw_customer1, getattr(hq_session, "customers", None)])
 
         st.subheader("Balances & due dates (normalized)")
         if df_billing.empty:
-            st.info("Could not normalize billing fields automatically. See raw JSON above.")
+            st.info("Could not normalize billing fields automatically. Try clicking each expander above to inspect the raw values. "
+                    "If you see exact keys for amount/due date (e.g., 'solde', 'montantFacture', 'dateEcheance'), tell me and I'll add them.")
         else:
             st.dataframe(df_billing, use_container_width=True)
 
     st.markdown(
         """
         **Notes**  
-        • `hydroq-api` focuses on consumption retrieval (hourly/daily/monthly). [3](https://pypi.org/project/hydroq-api/)  
-        • `hydroqc` can retrieve general account/billing information via the customer portal (e.g., current balance and billing period projection). [1](https://hydroqc.ca/en/docs/overview/)[2](https://gitlab.com/hydroqc/hydroqc-docs/-/blob/main/content/en/docs/Overview/_index.md)  
+        • `st.json` renders valid JSON (dict/list or JSON strings). If a method returns a non‑JSON object,
+          prefer `st.write` or coerce to a dict first. [1](https://docs.streamlit.io/develop/api-reference/data/st.json)  
+        • `hydroq-api` focuses on consumption (hourly/daily/monthly). [2](https://docs.streamlit.io/develop/api-reference/status/st.error)  
+        • `hydroqc` can return general account info via the portal (balance, billing period projection); shapes vary by version. [3](https://github.com/homas01123/HydroQ)[4](https://github.com/hydrohub2/Hydroq)
         """
     )
