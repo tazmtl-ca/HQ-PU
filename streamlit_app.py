@@ -8,6 +8,67 @@ import requests  # for HTTPError handling
 st.set_page_config(page_title="Hydro‑Québec Usage Viewer", page_icon="⚡", layout="wide")
 st.title("⚡ Hydro‑Québec Usage Viewer")
 
+# ===== Normalizer (place near top) =====
+def normalize_usage_df(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """Normalize Hydro‑Québec usage columns for charting."""
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    df.rename(columns={c: c.lower() for c in df.columns}, inplace=True)
+
+    kwh_candidates = ["kwh", "kw_h", "valuekwh", "consumption", "energy", "valeur", "value"]
+    date_candidates_monthly = ["month", "periode", "period", "date", "mois"]
+    date_candidates_daily  = ["date", "jour", "day", "periode", "period"]
+    ts_candidates_hourly   = ["timestamp", "time", "datetime", "heure", "period", "periode"]
+
+    def first_existing(cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+
+    if granularity == "Monthly":
+        date_col = first_existing(date_candidates_monthly)
+        val_col  = first_existing(kwh_candidates)
+        if date_col and date_col != "month":
+            df.rename(columns={date_col: "month"}, inplace=True)
+        if val_col and val_col != "kwh":
+            df.rename(columns={val_col: "kwh"}, inplace=True)
+        if "month" in df.columns:
+            try:
+                df["month"] = pd.to_datetime(df["month"]).dt.to_period("M").astype(str)
+            except Exception:
+                pass
+
+    elif granularity == "Daily":
+        date_col = first_existing(date_candidates_daily)
+        val_col  = first_existing(kwh_candidates)
+        if date_col and date_col != "date":
+            df.rename(columns={date_col: "date"}, inplace=True)
+        if val_col and val_col != "kwh":
+            df.rename(columns={val_col: "kwh"}, inplace=True)
+        if "date" in df.columns:
+            try:
+                df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+            except Exception:
+                pass
+
+    elif granularity == "Hourly":
+        ts_col  = first_existing(ts_candidates_hourly)
+        val_col = first_existing(kwh_candidates)
+        if ts_col and ts_col != "timestamp":
+            df.rename(columns={ts_col: "timestamp"}, inplace=True)
+        if val_col and val_col != "kwh":
+            df.rename(columns={val_col: "kwh"}, inplace=True)
+        if "timestamp" in df.columns:
+            try:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+            except Exception:
+                pass
+
+    return df
+
 # ---- Secrets ----
 email = st.secrets.get("HQ_EMAIL")
 password = st.secrets.get("HQ_PASSWORD")
@@ -78,7 +139,6 @@ def show_http_error(prefix: str, err: requests.exceptions.HTTPError):
 
 # ---- RUN block: only execute after clicking the button ----
 if run_clicked:
-    # Validate selection before making calls
     if granularity == "Daily" and start_date > end_date:
         st.error("Start date must be before end date.")
         st.stop()
@@ -94,40 +154,61 @@ if run_clicked:
         st.error(f"Login failed: {e}")
         st.stop()
 
-    # Fetch and render by granularity
     try:
+        # ==== HOURLY BRANCH ====
         if granularity == "Hourly":
             df = fetch_hourly_df()
+            df = normalize_usage_df(df, "Hourly")
+
             st.subheader("Hourly usage (last 24h)")
             st.dataframe(df, use_container_width=True)
-            # Expect columns like 'timestamp' and 'kWh'
-            if "timestamp" in df.columns and "kWh" in df.columns:
-                st.line_chart(df.set_index("timestamp")["kWh"])
+            if df.empty:
+                st.warning("No hourly data returned.")
+            elif {"timestamp", "kwh"}.issubset(df.columns):
+                st.line_chart(df.set_index("timestamp")["kwh"])
             else:
-                st.info("Hourly data columns differ from expected ('timestamp', 'kWh'). Showing raw table above.")
+                st.info("Hourly data columns differ; showing normalized table above.")
 
+        # ==== DAILY BRANCH ====
         elif granularity == "Daily":
             df = fetch_daily_df(start_date.isoformat(), end_date.isoformat())
+            df = normalize_usage_df(df, "Daily")
+
             st.subheader(f"Daily usage ({start_date} → {end_date})")
             st.dataframe(df, use_container_width=True)
-            if "date" in df.columns and "kWh" in df.columns:
-                st.bar_chart(df.set_index("date")["kWh"])
+            if df.empty:
+                st.warning("No daily data returned for the selected range.")
+            elif {"date", "kwh"}.issubset(df.columns):
+                st.bar_chart(df.set_index("date")["kwh"])
             else:
-                st.info("Daily data columns differ from expected ('date', 'kWh'). Showing raw table above.")
+                st.info("Daily data columns differ; showing normalized table above.")
 
+        # ==== MONTHLY BRANCH ====
         else:  # Monthly
             df = fetch_monthly_df()
+
+            # STEP 1: Diagnostics (you can remove later)
+            st.write("Monthly DF shape:", df.shape)
+            st.write("Monthly DF columns:", list(df.columns))
+            st.write("Sample rows:")
+            st.dataframe(df.head(10))
+
+            # Normalize and chart
+            df = normalize_usage_df(df, "Monthly")
+
             st.subheader("Monthly usage (~last 12 months)")
             st.dataframe(df, use_container_width=True)
-            if "month" in df.columns and "kWh" in df.columns:
-                st.bar_chart(df.set_index("month")["kWh"])
+            if df.empty:
+                st.warning("No monthly data returned for your account/period.")
+            elif {"month", "kwh"}.issubset(df.columns):
+                st.bar_chart(df.set_index("month")["kwh"])
             else:
-                st.info("Monthly data columns differ from expected ('month', 'kWh'). Showing raw table above.")
+                st.info("Monthly data columns differ; showing normalized table above.")
 
     except requests.exceptions.HTTPError as http_err:
         show_http_error("Data retrieval", http_err)
     except Exception as e:
-        # Show full stacktrace for non-HTTP exceptions
         st.exception(e)
+
 else:
     st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
