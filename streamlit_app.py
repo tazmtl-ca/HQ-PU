@@ -24,8 +24,8 @@ def parse_monthly_rows_from_results(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame,
     """
     Parse a DataFrame that has a 'results' column of JSON strings where each row contains:
     {
-      "compare": {...},
-      "courant": {...}
+      "compare": {... last year's month ...},
+      "courant": {... current month's data ...}
     }
     Returns (df_monthly_current, df_monthly_compare).
     """
@@ -154,10 +154,10 @@ if not email or not password:
     st.error("Missing HQ_EMAIL / HQ_PASSWORD secrets in Streamlit Cloud.")
     st.stop()
 
-# Optional identifiers used by some hydroqc billing flows (from your invoice)
-cust_id = st.secrets.get("HQ_CUSTOMER_ID")
-acct_id = st.secrets.get("HQ_ACCOUNT_ID")
-ctrt_id = st.secrets.get("HQ_CONTRACT_ID")
+# NOTE: You said you’ll store IDs with digits only (no spaces):
+cust_id = st.secrets.get("HQ_CUSTOMER_ID")  # 10 digits (leading zero if needed)
+acct_id = st.secrets.get("HQ_ACCOUNT_ID")   # account id
+ctrt_id = st.secrets.get("HQ_CONTRACT_ID")  # 10 digits (leading zero if needed)
 
 # ------------------------------------------------------------------------------
 # UI: Tabs
@@ -314,27 +314,23 @@ with usage_tab:
     else:
         st.info("Select granularity and (for daily) a date range, then click ▶️ RUN.")
 
-
 # ------------------------------------------------------------------------------
-# Billing tab (balances & due dates) via hydroqc — async + detailed errors
+# Billing tab (balances & due dates) via hydroqc — async aware (single call per method)
 # ------------------------------------------------------------------------------
 with billing_tab:
     st.subheader("Balances & Due Dates (via hydroqc)")
     st.caption(
-        "This tab uses the Hydro‑Quebec API Wrapper (`hydroqc`) for account & billing. "
+        "This tab uses the Hydro‑Quebec API Wrapper (`Hydroqc`) for account & billing. "
         "Usage remains powered by `hydroq-api` (consumption only)."
     )
 
-    import asyncio, inspect, threading, json
-    from typing import Any, Dict, List
-
-    # --- Async helpers with ERROR VISIBILITY ---
+    # --- Async helpers ---
     def run_coro(coro):
         """Run a coroutine safely in Streamlit and propagate exceptions."""
         try:
             return asyncio.run(coro)
         except RuntimeError:
-            # If Streamlit has a loop, run ours in a worker thread
+            # If an event loop is already running, run in a separate thread
             result_container: Dict[str, Any] = {}
             error_container: Dict[str, Any] = {}
             def runner():
@@ -352,9 +348,32 @@ with billing_tab:
                 raise error_container["error"]
             return result_container.get("result")
 
-    def maybe_call_async(func, *args, **kwargs):
-        """Call a function; if it returns a coroutine, await it and surface exceptions."""
-        res = func(*args, **kwargs)
+    def call_hydroqc_once(obj: Any, method_name: str) -> Any:
+        """
+        Inspect the method signature and call it exactly once, passing Secrets IDs
+        only if those parameters exist. If it returns a coroutine, await exactly once.
+        """
+        if not hasattr(obj, method_name):
+            raise AttributeError(f"{method_name} not found on session.")
+
+        m = getattr(obj, method_name)
+        sig = inspect.signature(m)
+        kwargs = {}
+
+        # Map our IDs to common parameter names (you'll provide digits-only IDs)
+        for pname, param in sig.parameters.items():
+            p = pname.lower()
+            if p in {"customer", "customer_id"} and cust_id:
+                kwargs[pname] = cust_id
+            elif p in {"account", "account_id"} and acct_id:
+                kwargs[pname] = acct_id
+            elif p in {"contract", "contract_id"} and ctrt_id:
+                kwargs[pname] = ctrt_id
+            elif p in {"verify_ssl"}:
+                kwargs[pname] = True
+
+        # Call exactly once: with kwargs if params exist, else no-args
+        res = m(**kwargs) if sig.parameters else m()
         return run_coro(res) if inspect.iscoroutine(res) else res
 
     # --- Build hydroqc session (robust across versions) ---
@@ -372,7 +391,10 @@ with billing_tab:
             except TypeError:
                 user = WebUser(_email, _password)
             # login may be async
-            maybe_call_async(user.login)
+            res = user.login()
+            if inspect.iscoroutine(res):
+                run_coro(res)
+            # attach IDs if attributes exist
             for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
                 if value and hasattr(user, name):
                     try: setattr(user, name, value)
@@ -386,7 +408,9 @@ with billing_tab:
                 except TypeError:
                     client = HydroClient()
                     if hasattr(client, "login"):
-                        maybe_call_async(client.login, _email, _password)
+                        res = client.login(_email, _password)
+                        if inspect.iscoroutine(res):
+                            run_coro(res)
                 for name, value in [("customer", cust_id), ("account", acct_id), ("contract", ctrt_id)]:
                     if value and hasattr(client, name):
                         try: setattr(client, name, value)
@@ -397,7 +421,7 @@ with billing_tab:
                     f"Unable to initialize hydroqc session. WebUser error: {e_webuser}; HydroClient error: {e_client}"
                 )
 
-    # --- Safe render (dict/list or fall back to write) ---
+    # --- Extract billing from available methods/properties ---
     def safe_show(title: str, value: Any):
         with st.expander(title):
             if isinstance(value, (dict, list)):
@@ -405,42 +429,19 @@ with billing_tab:
             else:
                 st.write(type(value).__name__, value)
 
-    # --- Flexible call with signature probing and EXCEPTION REPORTING ---
-    import inspect
-    def flexible_call(obj: Any, method_name: str) -> Any:
-        """Call obj.method_name and await if needed; pass IDs if signature supports them; show exceptions."""
-        if not hasattr(obj, method_name):
-            st.warning(f"{method_name} not found on session object.")
-            return None
-        m = getattr(obj, method_name)
-        # Try no-arg call
-        try:
-            res = m()
-            return run_coro(res) if inspect.iscoroutine(res) else res
-        except Exception as e1:
-            # Try kwargs with invoice IDs
-            try:
-                sig = inspect.signature(m)
-                kwargs = {}
-                for pname in sig.parameters.keys():
-                    p = pname.lower()
-                    if p in {"customer", "customer_id"} and cust_id: kwargs[pname] = cust_id
-                    if p in {"account", "account_id"} and acct_id: kwargs[pname] = acct_id
-                    if p in {"contract", "contract_id"} and ctrt_id: kwargs[pname] = ctrt_id
-                    if p in {"verify_ssl"}: kwargs[pname] = True
-                res = m(**kwargs)
-                return run_coro(res) if inspect.iscoroutine(res) else res
-            except Exception as e2:
-                # Show both exceptions clearly
-                st.error(f"{method_name} failed (no-arg): {e1}")
-                st.error(f"{method_name} failed (kwargs): {e2}")
-                return None
-
-    # --- Normalize billing (English & French keys) ---
     def deep_find_items(obj) -> List[Dict[str, Any]]:
+        """
+        Recursively walk dict/list and extract candidate billing dicts that contain
+        amount/balance and due date. Supports English & French keys commonly seen.
+        """
         found: List[Dict[str, Any]] = []
-        amount_keys = {"amount", "balance", "solde", "montant", "montantfacture", "montantsolde", "prochainmontant", "total", "totalfacture"}
-        due_keys    = {"duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"}
+        amount_keys = {
+            "amount", "balance", "solde", "montant", "montantfacture", "montantsolde",
+            "prochainmontant", "total", "totalfacture"
+        }
+        due_keys    = {
+            "duedate", "dateecheance", "echeance", "prochaineecheance", "date_due", "date_limite"
+        }
 
         def normkey(k: str) -> str:
             return k.replace("_", "").replace("-", "").lower()
@@ -455,7 +456,12 @@ with billing_tab:
                         "amount": x.get(amt_k) if amt_k else None,
                         "due_date": x.get(due_k) if due_k else None,
                     }
-                    for id_key in ["contract", "numeroContrat", "contractId", "account", "compte", "accountId", "customer", "client", "customerId"]:
+                    # capture identifiers if present
+                    for id_key in [
+                        "contract", "numeroContrat", "contractId",
+                        "account", "compte", "accountId",
+                        "customer", "client", "customerId"
+                    ]:
                         if id_key in x:
                             rec[id_key] = x.get(id_key)
                     found.append(rec)
@@ -469,17 +475,16 @@ with billing_tab:
     def normalize_billing(raws: List[Any]) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
         for raw in raws:
-            if raw is None:  # skip empties
+            if raw is None:
                 continue
             if isinstance(raw, (dict, list)):
                 rows.extend(deep_find_items(raw))
-            else:
-                # Try to JSON-decode strings
-                if isinstance(raw, str):
-                    try:
-                        j = json.loads(raw); rows.extend(deep_find_items(j))
-                    except Exception:
-                        pass
+            elif isinstance(raw, str):
+                try:
+                    j = json.loads(raw)
+                    rows.extend(deep_find_items(j))
+                except Exception:
+                    pass
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).drop_duplicates()
@@ -510,11 +515,32 @@ with billing_tab:
             st.error(f"hydroqc login failed: {e}")
             st.stop()
 
-        # Call methods your session lists (and surface exceptions if any)
-        portal_status = flexible_call(hq_session, "check_hq_portal_status")
-        raw_info      = flexible_call(hq_session, "get_info")
-        raw_customers = flexible_call(hq_session, "fetch_customers_info")
-        raw_customer1 = flexible_call(hq_session, "get_customer")
+        # Call methods your session lists (one call each, await if needed)
+        portal_status = None
+        raw_info = None
+        raw_customers = None
+        raw_customer1 = None
+
+        try:
+            portal_status = call_hydroqc_once(hq_session, "check_hq_portal_status")
+        except Exception as e:
+            st.error(f"check_hq_portal_status error: {e}")
+
+        try:
+            raw_info = call_hydroqc_once(hq_session, "get_info")
+        except Exception as e:
+            st.error(f"get_info error: {e}")
+
+        try:
+            raw_customers = call_hydroqc_once(hq_session, "fetch_customers_info")
+        except Exception as e:
+            st.error(f"fetch_customers_info error: {e}")
+
+        try:
+            raw_customer1 = call_hydroqc_once(hq_session, "get_customer")
+        except Exception as e:
+            st.error(f"get_customer error: {e}")
+
         customers_prop = getattr(hq_session, "customers", None)
 
         safe_show("Portal status (raw)", portal_status)
@@ -529,16 +555,15 @@ with billing_tab:
         if df_billing.empty:
             st.info(
                 "No billing fields were found. If errors appeared above, they typically indicate a portal maintenance, "
-                "a version mismatch, or missing invoice IDs (customer/account/contract)."
+                "a version mismatch, or missing/incorrect invoice IDs (customer/account/contract)."
             )
         else:
             st.dataframe(df_billing, use_container_width=True)
 
     st.markdown(
         """
-        **Notes**  
-        • `st.json` only renders valid JSON (dict/list or JSON strings); for other types use `st.write`. [5](https://github.com/lvg77/hydroq-api/releases)  
-        • Streamlit does not officially support caching **async** functions; we await results without caching them. [6](https://hydroqc.readthedocs.io/en/latest/reference/hydroqc.hydro_api.html)[7](https://gitlab.com/hydroqc/hydroqc/-/blob/main/README.md)  
-        • The `hydroqc` project can retrieve **general account data** (balance, billing period projection), but portal changes or outages can cause calls to fail. [8](https://procodebase.com/article/integrating-apis-with-streamlit-applications)[1](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.cache_resource)
+        **Tips**  
+        • Provide IDs with digits only (no spaces).  
+        • If you change Secrets or upgrade dependencies, click **🧹 Clear billing resource cache** and run again.  
         """
     )
